@@ -302,13 +302,102 @@ class Game:
 
         direction = 1 if next_idx > start_idx else -1
 
-        tr = Train(id=self.next_train_id, line_id=line_id, position_index=start_idx, direction=direction)
+        # Set initial state for dynamic movement
+        tr = Train(id=self.next_train_id, line_id=line_id, current_station_id=start_station_id, target_station_id=next_station_id)
         self.trains[tr.id] = tr
         self.next_train_id += 1
 
         # Perform initial passenger pickup
         start_station = self.stations[start_station_id]
         tr.load_passengers(start_station)
+    
+    def update(self, dt):
+        # If paused, we only process a delta time of 0 to freeze game state
+        # but we still run the loop to check for game over conditions.
+        effective_dt = 0 if self.paused else dt
+
+        self.time_elapsed += effective_dt
+        # spawn passengers periodically when not paused
+        if not self.paused and self.time_elapsed - self.last_spawn > 1.0:  # every second
+            self.spawn_passenger()
+            self.last_spawn = self.time_elapsed
+        # move trains
+        for tr in list(self.trains.values()):
+            line = self.lines.get(tr.line_id)
+            if not line or not tr.current_station_id or not tr.target_station_id:
+                continue
+
+            s_from = self.stations[tr.current_station_id]
+            s_to = self.stations[tr.target_station_id]
+
+            # interpolate
+            sx,sy = s_from.pos
+            tx,ty = s_to.pos
+            dist = math.hypot(tx-sx, ty-sy)
+            if dist == 0:
+                tr.progress = 1.0
+            else:
+                tr.progress += (tr.speed * effective_dt) / dist # speed is now pixels/sec
+
+            if tr.progress >= 1.0:
+                # arrive at s_to
+                tr.progress = 0.0
+                last_station_id = tr.current_station_id
+                tr.current_station_id = tr.target_station_id
+
+                # drop off
+                dropped = tr.drop_off(s_to)
+                self.score += dropped
+
+                # pick up if capacity
+                if tr.available_capacity() > 0:
+                    tr.load_passengers(s_to)
+
+                # AI: Choose next station
+                tr.target_station_id = self.choose_next_station(tr, line, last_station_id)
+
+        # overcrowding check
+        for s in self.stations.values():
+            if len(s.waiting) > 12:
+                # game over
+                self.running = False
+
+    def choose_next_station(self, train: Train, line: Line, last_station_id: int) -> int | None:
+        """AI logic for a train to decide where to go next."""
+        current_station_id = train.current_station_id
+        neighbors = line.get_neighbors(current_station_id)
+
+        if not neighbors:
+            return None # End of the line, nowhere to go
+
+        # If it's a simple path (not a junction), just continue or turn around.
+        if len(neighbors) == 1:
+            return neighbors[0] # Only one way to go
+
+        # At a junction.
+        # Exclude the path we just came from, unless we have to turn around.
+        potential_paths = [n for n in neighbors if n != last_station_id]
+        if not potential_paths:
+            return last_station_id # Must turn around
+
+        # If there are passengers, try to find a path that serves them.
+        if train.passengers:
+            passenger_dests = {p.dest_shape for p in train.passengers}
+            
+            best_path = None
+            for path_station_id in potential_paths:
+                # Simple check: does this immediate neighbor match a destination?
+                if self.stations[path_station_id].shape in passenger_dests:
+                    return path_station_id # Greedily go to the matching station
+
+            # More advanced: Do a quick search down each path to see if it contains a destination shape.
+            # For now, we'll just pick one of the potential paths.
+            # A simple heuristic is to continue "straight" if possible, but that's complex.
+            # We'll just pick the first available path.
+            return random.choice(potential_paths)
+
+        # No passengers, just explore. Avoid turning back if possible.
+        return random.choice(potential_paths)
 
     def draw_trail_in_line(self, station_a_id: int, station_b_id: int):
         """
@@ -331,59 +420,6 @@ class Game:
             self.next_line_id += 1
 
         target_line.add_trail(new_trail)
-
-    def update(self, dt):
-        # If paused, we only process a delta time of 0 to freeze game state
-        # but we still run the loop to check for game over conditions.
-        effective_dt = 0 if self.paused else dt
-
-        self.time_elapsed += effective_dt
-        # spawn passengers periodically when not paused
-        if not self.paused and self.time_elapsed - self.last_spawn > 1.0:  # every second
-            self.spawn_passenger()
-            self.last_spawn = self.time_elapsed
-        # move trains
-        for tr in list(self.trains.values()):
-            line = self.lines.get(tr.line_id)
-            station_sequence = line.station_sequence() if line else []
-            if not station_sequence or len(station_sequence) < 2:
-                continue
-            # compute target indices
-            idx = tr.position_index
-            next_idx = idx + tr.direction
-            if next_idx < 0 or next_idx >= len(station_sequence):
-                # reverse
-                tr.direction *= -1
-                next_idx = idx + tr.direction
-            s_from = self.stations[station_sequence[idx]]
-            s_to = self.stations[station_sequence[next_idx]]
-            # interpolate
-            sx,sy = s_from.pos
-            tx,ty = s_to.pos
-            dist = math.hypot(tx-sx, ty-sy)
-            if dist == 0:
-                tr.progress = 1.0
-            else:
-                tr.progress += (tr.speed * effective_dt) / dist
-            if tr.progress >= 1.0:
-                # arrive at s_to
-                tr.progress = 0.0
-                tr.position_index = next_idx
-                # drop off
-                dropped = tr.drop_off(s_to)
-                self.score += dropped
-                # pick up if capacity
-                cap_before = tr.available_capacity()
-                if cap_before > 0:
-                    # naive: load any passengers at station
-                    loaded = tr.load_passengers(s_to)
-                # small dwell time could be simulated but skipped
-
-        # overcrowding check
-        for s in self.stations.values():
-            if len(s.waiting) > 12:
-                # game over
-                self.running = False
 
     def draw_station(self, s: Station):
         x,y = s.pos
@@ -462,14 +498,10 @@ class Game:
     def draw_train(self, tr: Train):
         line = self.lines.get(tr.line_id)
         station_sequence = line.station_sequence() if line else []
-        if not station_sequence or len(station_sequence) < 2:
+        if not line or not tr.current_station_id or not tr.target_station_id:
             return
-        idx = tr.position_index
-        next_idx = idx + tr.direction
-        if next_idx < 0 or next_idx >= len(station_sequence):
-            next_idx = idx
-        s_from = self.stations[station_sequence[idx]]
-        s_to = self.stations[station_sequence[next_idx]]
+        s_from = self.stations[tr.current_station_id]
+        s_to = self.stations[tr.target_station_id]
         fx,fy = s_from.pos
         tx,ty = s_to.pos
         x = fx + (tx-fx)*tr.progress

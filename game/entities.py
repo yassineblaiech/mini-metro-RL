@@ -169,18 +169,27 @@ class Line:
         
         self._station_sequence = longest_path
 
+    def get_neighbors(self, station_id: int) -> List[int]:
+        """Gets all stations directly connected to the given station_id on this line."""
+        neighbors = []
+        for trail in self.trails:
+            if trail.station_a == station_id: neighbors.append(trail.station_b)
+            elif trail.station_b == station_id: neighbors.append(trail.station_a)
+        return neighbors
+
 @dataclass
 class Train:
     id: int
     line_id: int
     position_index: int = 0  # index into line stations list
     progress: float = 0.0  # 0..1 between stations
-    speed: float = 0.7  # units per second sensible for game.
+    speed: float = 50.0  # pixels per second
     capacity: int = 4
     passengers: List[Passenger] = field(default_factory=list)
     direction: int = 1  # 1 forward, -1 backward
     carriages: int = 0
-
+    current_station_id: int | None = None
+    target_station_id: int | None = None
     def effective_capacity(self):
         return self.capacity + self.carriages * 3
 
