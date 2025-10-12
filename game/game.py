@@ -45,6 +45,10 @@ class Game:
         # editing existing line state
         self.current_edit_line_id = None
         self.current_edit_anchor = None  # 'start' or 'end'
+        # drag and drop state
+        self.dragging_tool = None
+        self.pending_train_placement = None # stores {'line_id': int, 'trail': Trail}
+
 
         self.init_map()
 
@@ -124,14 +128,32 @@ class Game:
                                 tx = self.screen.get_width() - self.sidebar_width + 12
                                 ty = tools_y + i*44
                                 if tx <= mx <= tx + self.sidebar_width - 24 and ty <= my <= ty + 36:
-                                    self.selected_tool = t
+                                    if t == 'locomotive':
+                                        self.dragging_tool = 'locomotive'
+                                    else:
+                                        self.selected_tool = t
                                     break
                         continue
                     # map click
                     pos = (mx,my)
                     clicked = self.station_at_pos(pos)
                     if clicked:
-                        if self.selected_tool == 'line':
+                        if self.pending_train_placement:
+                            # We've dropped a loco and are now choosing a direction. This takes priority.
+                            pending = self.pending_train_placement
+                            trail = pending['trail']
+                            if clicked.id == trail.station_a or clicked.id == trail.station_b:
+                                self.place_new_train(
+                                    line_id=pending['line_id'],
+                                    start_station_id=trail.station_a if clicked.id == trail.station_b else trail.station_b,
+                                    next_station_id=clicked.id
+                                )
+                                self.pending_train_placement = None
+                            else:
+                                # Clicked somewhere else, cancel placement
+                                self.pending_train_placement = None
+
+                        elif self.selected_tool == 'line':
                             if self.first_station_for_trail is None:
                                 # This is the first station clicked for a new trail.
                                 self.first_station_for_trail = clicked.id
@@ -168,14 +190,6 @@ class Game:
                                 # Reset for the next operation.
                                 self.first_station_for_trail = None
                                 self.temp_mouse_pos = None
-
-                        elif self.selected_tool == 'locomotive':
-                            lid = self.find_line_with_station(clicked.id)
-                            if lid is not None:
-                                tr = Train(id=self.next_train_id, line_id=lid)
-                                self.trains[tr.id] = tr
-                                self.next_train_id += 1
-                                self.first_station_for_trail = None # Cancel line drawing
                         elif self.selected_tool == 'carriage':
                             lid = self.find_line_with_station(clicked.id)
                             if lid is not None:
@@ -199,16 +213,25 @@ class Game:
                     self.first_station_for_trail = None
             elif ev.type == pygame.MOUSEMOTION:
                 # update temporary mouse pos when drawing a line
-                if self.first_station_for_trail is not None and self.selected_tool in ['line', 'remove']:
+                if (self.first_station_for_trail is not None and self.selected_tool in ['line', 'remove']) or self.dragging_tool:
                     self.temp_mouse_pos = ev.pos
             elif ev.type == pygame.MOUSEBUTTONUP:
-                # The old MOUSEBUTTONUP logic for drawing is now handled by MOUSEBUTTONDOWN.
-                # This block can be cleared or used for other features later.
-                pass
+                if ev.button == 1 and self.dragging_tool == 'locomotive':
+                    # Dropped the locomotive
+                    self.dragging_tool = None
+                    found = self.find_trail_at_pos(ev.pos)
+                    if found:
+                        self.pending_train_placement = {
+                            'line_id': found['line_id'],
+                            'trail': found['trail']
+                        }
+                    self.temp_mouse_pos = None
+
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_SPACE:
                     self.paused = not self.paused
                 elif ev.key == pygame.K_t:
+                    # This key is now deprecated in favor of the drag/drop UI
                     # add locomotive to selected line (select by clicking any station earlier)
                     pos = pygame.mouse.get_pos()
                     st = self.station_at_pos(pos)
@@ -219,6 +242,7 @@ class Game:
                             self.trains[tr.id] = tr
                             self.next_train_id += 1
                 elif ev.key == pygame.K_c:
+                    # This key is now deprecated in favor of the UI tool
                     # add carriage to last train
                     if self.trains:
                         last = max(self.trains.keys())
@@ -237,6 +261,54 @@ class Game:
             if station_id in line.get_stations():
                 return lid
         return None
+
+    def find_trail_at_pos(self, pos, threshold=10):
+        """Finds the closest trail to a given mouse position."""
+        px, py = pos
+        for line_id, line in self.lines.items():
+            for trail in line.trails:
+                s1 = self.stations.get(trail.station_a)
+                s2 = self.stations.get(trail.station_b)
+                if not s1 or not s2: continue
+
+                x1, y1 = s1.pos
+                x2, y2 = s2.pos
+
+                # Basic point-to-line-segment distance calculation
+                dx, dy = x2 - x1, y2 - y1
+                if dx == 0 and dy == 0: continue # segment is a point
+                
+                t = ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)
+                t = max(0, min(1, t)) # clamp to segment
+
+                closest_x, closest_y = x1 + t * dx, y1 + t * dy
+                dist = math.hypot(px - closest_x, py - closest_y)
+
+                if dist < threshold:
+                    return {'line_id': line_id, 'trail': trail}
+        return None
+
+    def place_new_train(self, line_id: int, start_station_id: int, next_station_id: int):
+        """Creates and places a new train on a line, setting its initial direction."""
+        line = self.lines.get(line_id)
+        if not line: return
+
+        station_sequence = line.station_sequence()
+        try:
+            start_idx = station_sequence.index(start_station_id)
+            next_idx = station_sequence.index(next_station_id)
+        except ValueError:
+            return # Should not happen if logic is correct
+
+        direction = 1 if next_idx > start_idx else -1
+
+        tr = Train(id=self.next_train_id, line_id=line_id, position_index=start_idx, direction=direction)
+        self.trains[tr.id] = tr
+        self.next_train_id += 1
+
+        # Perform initial passenger pickup
+        start_station = self.stations[start_station_id]
+        tr.load_passengers(start_station)
 
     def draw_trail_in_line(self, station_a_id: int, station_b_id: int):
         """
@@ -431,15 +503,28 @@ class Game:
         self.draw_sidebar()
 
         # Draw preview line if we are in the middle of creating a trail
-        if self.first_station_for_trail is not None and self.temp_mouse_pos is not None and self.selected_tool in ['line', 'remove']:
+        if self.first_station_for_trail is not None and self.temp_mouse_pos is not None:
             start_pos = self.stations[self.first_station_for_trail].pos
             end_pos = self.temp_mouse_pos
             preview_color = self.selected_color
             if self.selected_tool == 'remove':
-                # Use a distinct color for removal preview, like gray or red.
                 preview_color = (128, 128, 128)
-            
             pygame.draw.line(self.screen, preview_color, start_pos, end_pos, 4)
+        
+        # Draw dragged locomotive icon
+        if self.dragging_tool == 'locomotive' and self.temp_mouse_pos:
+            icon_x, icon_y = self.temp_mouse_pos
+            pygame.draw.rect(self.screen, (70,70,70), (icon_x-10, icon_y-6, 20, 12))
+            pygame.draw.circle(self.screen, (30,30,30), (icon_x-4, icon_y+8), 3)
+            pygame.draw.circle(self.screen, (30,30,30), (icon_x+6, icon_y+8), 3)
+
+        # Draw direction selection prompt
+        if self.pending_train_placement:
+            trail = self.pending_train_placement['trail']
+            s1 = self.stations[trail.station_a]
+            s2 = self.stations[trail.station_b]
+            pygame.draw.circle(self.screen, (255, 255, 0), s1.pos, 20, 4) # Yellow highlight
+            pygame.draw.circle(self.screen, (255, 255, 0), s2.pos, 20, 4) # Yellow highlight
 
     def draw_sidebar(self):
         sx = self.screen.get_width() - self.sidebar_width

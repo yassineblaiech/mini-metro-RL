@@ -205,6 +205,24 @@ class Train:
         self.passengers.extend(to_take)
         return len(to_take)
 
+    def initial_load(self, station: Station, line: Line):
+        """
+        Special loading logic for when a train is first placed.
+        It only picks up passengers whose destination is on the line.
+        """
+        cap = self.available_capacity()
+        if cap <= 0:
+            return 0
+        
+        line_stations = line.get_stations()
+        to_take = []
+        # In a more complex system, we'd check if a path exists. Here, we just check if the shape is on the line.
+        line_shapes = {s.shape for sid, s in station.parent_stations.items() if sid in line_stations}
+
+        station.remove_passengers_if(lambda p: p.dest_shape in line_shapes and len(to_take) < cap, to_take)
+        self.passengers.extend(to_take)
+        return len(to_take)
+
     def drop_off(self, station: Station):
         dropped = [p for p in self.passengers if p.dest_shape == station.shape]
         self.passengers = [p for p in self.passengers if p.dest_shape != station.shape]
