@@ -75,7 +75,36 @@ class Line:
             (t.station_a == new_trail.station_b and t.station_b == new_trail.station_a)
             for t in self.trails
         )
-        return is_connected and not is_duplicate
+
+        if not (is_connected and not is_duplicate):
+            return False
+
+        # Check if the line is already a closed loop. If so, no more trails can be added.
+        adj = {s: [] for s in self.get_stations()}
+        for t in self.trails:
+            adj[t.station_a].append(t.station_b)
+            adj[t.station_b].append(t.station_a)
+        
+        # A line is a loop if it has stations and none of them are endpoints (degree 1).
+        is_loop = self.trails and all(len(neighbors) != 1 for neighbors in adj.values())
+        if is_loop:
+            return False
+
+        # Prevent creating a trail from an endpoint to a station in the middle of the sequence.
+        # This avoids creating small, inefficient loops.
+        sequence = self.station_sequence()
+        if len(sequence) > 1:
+            start_node, end_node = sequence[0], sequence[-1]
+            s_a, s_b = new_trail.station_a, new_trail.station_b
+
+            # Check if connecting from an endpoint (start_node) to a station already in the line
+            if (s_a == start_node and s_b in sequence and s_b != end_node) or \
+               (s_b == start_node and s_a in sequence and s_a != end_node) or \
+               (s_a == end_node and s_b in sequence and s_b != start_node) or \
+               (s_b == end_node and s_a in sequence and s_a != start_node):
+                return False
+
+        return True
 
     def add_trail(self, trail: Trail):
         """Adds a trail and recalculates the main station sequence."""
@@ -84,6 +113,20 @@ class Line:
 
         self.trails.append(trail)
         self.recalculate_sequence()
+
+    def remove_trail(self, station_a_id: int, station_b_id: int):
+        """Removes a trail between two stations and recalculates the sequence."""
+        trail_to_remove = None
+        for t in self.trails:
+            if (t.station_a == station_a_id and t.station_b == station_b_id) or \
+               (t.station_a == station_b_id and t.station_b == station_a_id):
+                trail_to_remove = t
+                break
+
+        if trail_to_remove:
+            self.trails.remove(trail_to_remove)
+            # After removing a trail, the line might be split. We recalculate the main path.
+            self.recalculate_sequence()
 
     def recalculate_sequence(self):
         """

@@ -36,7 +36,7 @@ class Game:
         self.current_line_drawing = None  # line id being drawn
         self.selected_line = None
         # UI/tool state
-        self.tools = ['line', 'locomotive', 'carriage', 'interchange']
+        self.tools = ['line', 'remove', 'locomotive', 'carriage', 'interchange']
         self.selected_tool = 'line'
         self.available_colors = LINE_COLORS
         self.selected_color = self.available_colors[0]
@@ -53,24 +53,11 @@ class Game:
         w,h = self.screen.get_size()
         margin = 60
         for i in range(8):
-            x = random.randint(margin, w-margin)
+            x = random.randint(margin, w - self.sidebar_width - margin)
             y = random.randint(margin, h-margin)
             s = Station(id=self.next_station_id, pos=(x,y), shape=random.choice(SHAPES))
             self.stations[self.next_station_id] = s
             self.next_station_id += 1
-        # create a starting line connecting first three stations
-        ids = list(self.stations.keys())
-        if len(ids) >= 3:
-            line = Line(id=self.next_line_id, color=random.choice(LINE_COLORS))
-            line.add_trail(Trail(ids[0], ids[1]))
-            line.add_trail(Trail(ids[1], ids[2]))
-
-            self.lines[self.next_line_id] = line
-            # add a train
-            tr = Train(id=self.next_train_id, line_id=line.id)
-            self.trains[tr.id] = tr
-            self.next_train_id += 1
-            self.next_line_id += 1
         # generate a few convex obstacles (rivers/lakes) smaller than 10% of map area and not containing stations
         w,h = self.screen.get_size()
         map_area = w * h
@@ -79,7 +66,7 @@ class Game:
         while len(self.obstacles) < 2 and attempts < 200:
             attempts += 1
             # random convex polygon: pick center and radius, create regular-ish polygon with jitter
-            cx = random.randint(80, w-80)
+            cx = random.randint(80, w - self.sidebar_width - 80)
             cy = random.randint(80, h-80)
             sides = random.randint(3,6)
             max_radius = int(min(w,h) * 0.12)
@@ -160,6 +147,27 @@ class Game:
                                 # Reset for the next trail operation.
                                 self.first_station_for_trail = None
                                 self.temp_mouse_pos = None
+                        
+                        elif self.selected_tool == 'remove':
+                            if self.first_station_for_trail is None:
+                                # First station of the trail to remove.
+                                self.first_station_for_trail = clicked.id
+                                self.temp_mouse_pos = pos
+                            else:
+                                # Second station. Attempt to remove the trail.
+                                station_a_id = self.first_station_for_trail
+                                station_b_id = clicked.id
+
+                                if station_a_id != station_b_id:
+                                    # Find the line that contains both stations
+                                    line_a = self.find_line_with_station(station_a_id)
+                                    line_b = self.find_line_with_station(station_b_id)
+                                    if line_a is not None and line_a == line_b:
+                                        self.lines[line_a].remove_trail(station_a_id, station_b_id)
+
+                                # Reset for the next operation.
+                                self.first_station_for_trail = None
+                                self.temp_mouse_pos = None
 
                         elif self.selected_tool == 'locomotive':
                             lid = self.find_line_with_station(clicked.id)
@@ -191,7 +199,7 @@ class Game:
                     self.first_station_for_trail = None
             elif ev.type == pygame.MOUSEMOTION:
                 # update temporary mouse pos when drawing a line
-                if self.first_station_for_trail is not None:
+                if self.first_station_for_trail is not None and self.selected_tool in ['line', 'remove']:
                     self.temp_mouse_pos = ev.pos
             elif ev.type == pygame.MOUSEBUTTONUP:
                 # The old MOUSEBUTTONUP logic for drawing is now handled by MOUSEBUTTONDOWN.
@@ -423,10 +431,15 @@ class Game:
         self.draw_sidebar()
 
         # Draw preview line if we are in the middle of creating a trail
-        if self.first_station_for_trail is not None and self.temp_mouse_pos is not None:
+        if self.first_station_for_trail is not None and self.temp_mouse_pos is not None and self.selected_tool in ['line', 'remove']:
             start_pos = self.stations[self.first_station_for_trail].pos
             end_pos = self.temp_mouse_pos
-            pygame.draw.line(self.screen, self.selected_color, start_pos, end_pos, 4)
+            preview_color = self.selected_color
+            if self.selected_tool == 'remove':
+                # Use a distinct color for removal preview, like gray or red.
+                preview_color = (128, 128, 128)
+            
+            pygame.draw.line(self.screen, preview_color, start_pos, end_pos, 4)
 
     def draw_sidebar(self):
         sx = self.screen.get_width() - self.sidebar_width
@@ -457,6 +470,10 @@ class Game:
             icon_y = ty + 18
             if tname == 'line':
                 pygame.draw.circle(self.screen, self.selected_color, (icon_x, icon_y), 8)
+            elif tname == 'remove':
+                # Red 'X' icon for remove tool
+                pygame.draw.line(self.screen, (200, 0, 0), (icon_x - 6, icon_y - 6), (icon_x + 6, icon_y + 6), 3)
+                pygame.draw.line(self.screen, (200, 0, 0), (icon_x - 6, icon_y + 6), (icon_x + 6, icon_y - 6), 3)
             elif tname == 'locomotive':
                 # small train icon (rectangle + wheel)
                 pygame.draw.rect(self.screen, (70,70,70), (icon_x-10, ty+8, 20, 12))
