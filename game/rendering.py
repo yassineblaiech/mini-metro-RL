@@ -215,6 +215,21 @@ class Renderer:
             pygame.draw.circle(self.screen, (255, 255, 0), s1.pos, 20, 4)
             pygame.draw.circle(self.screen, (255, 255, 0), s2.pos, 20, 4)
 
+        # Draw debug highlight for selected passenger
+        if game.debug_selected_passenger:
+            # Draw final destination in red
+            if game.debug_selected_passenger.destination_id:
+                dest_station = game.stations.get(game.debug_selected_passenger.destination_id)
+                if dest_station:
+                    pygame.draw.circle(self.screen, (255, 0, 0), dest_station.pos, 22, 3) # Red for final destination
+
+            # Draw next hop in green, if it's an intermediate stop
+            if game.debug_selected_passenger.next_hop_id:
+                hop_station = game.stations.get(game.debug_selected_passenger.next_hop_id)
+                if hop_station:
+                    pygame.draw.circle(self.screen, (0, 200, 0), hop_station.pos, 25, 3) # Green for next hop
+
+
     def draw_sidebar(self, game: 'Game'):
         sx = self.screen.get_width() - game.sidebar_width
         pygame.draw.rect(self.screen, (245, 245, 245), (sx, 0, game.sidebar_width, self.screen.get_height()))

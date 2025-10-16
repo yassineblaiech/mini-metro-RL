@@ -53,6 +53,7 @@ class Game:
         # drag and drop state
         self.dragging_tool = None
         self.pending_train_placement = None # stores {'line_id': int, 'trail': Trail}
+        self.debug_selected_passenger: Passenger | None = None
 
         # Caches for performance
         self.line_station_shapes: Dict[int, set] = {}
@@ -178,6 +179,13 @@ class Game:
                         continue
                     # map click
                     pos = (mx,my)
+
+                    # Debugging: check for passenger click first
+                    passenger = self.passenger_at_pos(pos)
+                    if passenger:
+                        self.debug_selected_passenger = passenger
+                        continue # Prioritize passenger click over station click
+
                     clicked = self.station_at_pos(pos)
                     if clicked:
                         if self.pending_train_placement:
@@ -253,6 +261,7 @@ class Game:
                     else:
                         # clicked empty map - cancel any drawing operation
                         self.first_station_for_trail = None
+                        self.debug_selected_passenger = None
                         self.temp_mouse_pos = None
                 elif ev.button == 3:  # right click finish/cancel
                     # cancel any current drawing or editing
@@ -261,6 +270,7 @@ class Game:
                     self.current_edit_anchor = None
                     self.temp_mouse_pos = None
                     self.first_station_for_trail = None
+                    self.debug_selected_passenger = None
             elif ev.type == pygame.MOUSEMOTION:
                 # update temporary mouse pos when drawing a line
                 if (self.first_station_for_trail is not None and self.selected_tool in ['line', 'remove']) or self.dragging_tool:
@@ -304,6 +314,28 @@ class Game:
             sx,sy = s.pos
             if (sx-x)**2 + (sy-y)**2 <= radius*radius:
                 return s
+        return None
+
+    def passenger_at_pos(self, pos):
+        """Checks if a click position corresponds to a waiting passenger icon."""
+        mx, my = pos
+        passenger_icon_size = 4
+        spacing = 10
+        row_length = 5
+        
+        for station in self.stations.values():
+            start_x = station.pos[0] + 20
+            start_y = station.pos[1] - 10
+            
+            for i, p in enumerate(station.waiting):
+                row = i // row_length
+                col = i % row_length
+                px = start_x + col * spacing
+                py = start_y + row * spacing
+                
+                # Check if click is within the icon's bounding box (with a small buffer)
+                if (mx - px)**2 + (my - py)**2 <= (passenger_icon_size + 2)**2:
+                    return p
         return None
 
     def find_line_with_station(self, station_id):
@@ -417,32 +449,62 @@ class Game:
 
     def update_passenger_routes_at_station(self, station: Station):
         """For each passenger at a station, determine their best next hop."""
-        station_line_ids = self.station_lines.get(station.id, [])
-        if not station_line_ids: # Stranded station
-            for p in station.waiting:
-                p.next_hop_id = None # Nowhere to go
-            return
-
         for p in station.waiting:
             p.picked = False # Reset picked status when re-evaluating route
+
+            # --- Recalculate the ULTIMATE destination, prioritizing same-line travel ---
+            valid_destinations = [s for s in self.stations.values() if s.shape == p.dest_shape]
+            if not valid_destinations:
+                p.destination_id = None
+                p.next_hop_id = None
+                continue
+
+            station_line_ids = self.station_lines.get(station.id, [])
+
+            # Separate destinations into same-line and other-line
+            same_line_dests = []
+            other_dests = []
+            for dest in valid_destinations:
+                if any(dest.id in self.lines[lid].get_stations() for lid in station_line_ids):
+                    same_line_dests.append(dest)
+                else:
+                    other_dests.append(dest)
+
+            # Prioritize destinations on the same line
+            target_list = same_line_dests if same_line_dests else other_dests
+
+            best_destination = None
+            min_travel_dist = float('inf')
+
+            for dest_station in target_list:
+                # Use Dijkstra to find the actual travel distance from the passenger's origin
+                dist = self.find_shortest_path_distance(p.origin_id, dest_station.id)
+                if dist < min_travel_dist:
+                    min_travel_dist = dist
+                    best_destination = dest_station
+
+            p.destination_id = best_destination.id if best_destination else None
+
+            # --- Now, calculate the NEXT HOP based on the new ultimate destination ---
+            if p.destination_id is None:
+                p.next_hop_id = None # No path to any valid destination
+                continue
+
+            station_line_ids = self.station_lines.get(station.id, [])
             # Check if destination is on any of the lines serving the current station
             can_reach_directly = any(p.dest_shape in self.line_station_shapes.get(lid, set()) for lid in station_line_ids)
             if can_reach_directly:
                 p.next_hop_id = p.destination_id
                 continue
 
-            # Find the closest exchange station that leads to a line with the destination shape
-            best_exchange = None
-            min_dist = float('inf')
+            # Find a valid exchange station to get to the destination
+            best_exchange_id = None
             for exchange_id in self.exchange_stations:
-                # Is this exchange reachable from the current station?
-                if any(exchange_id in self.lines[lid].get_stations() for lid in station_line_ids):
-                    # Does this exchange connect to a line that has the required shape?
-                    if any(p.dest_shape in self.line_station_shapes.get(other_lid, set()) for other_lid in self.station_lines.get(exchange_id, [])):
-                        p.next_hop_id = exchange_id # Found a valid exchange path
-                        break # Simple approach: take the first valid one found. More complex could find closest.
-            else: # No exchange path found
-                p.next_hop_id = None
+                if any(exchange_id in self.lines[lid].get_stations() for lid in station_line_ids) and \
+                   any(p.dest_shape in self.line_station_shapes.get(other_lid, set()) for other_lid in self.station_lines.get(exchange_id, [])):
+                    best_exchange_id = exchange_id
+                    break # Simple approach: take the first valid one found.
+            p.next_hop_id = best_exchange_id
 
     def update(self, dt):
         # If paused, we only process a delta time of 0 to freeze game state
