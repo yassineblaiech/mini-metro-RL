@@ -24,6 +24,16 @@ class Station:
     def add_passenger(self, p: Passenger):
         self.waiting.append(p)
 
+    def remove_passengers_if(self, condition, out_list: list):
+        """Removes passengers that satisfy a condition and places them in out_list."""
+        kept = []
+        for p in self.waiting:
+            if condition(p):
+                out_list.append(p)
+            else:
+                kept.append(p)
+        self.waiting = kept
+
     def remove_passengers_for_shape(self, shape: ShapeType, count: int):
         taken = []
         remaining = []
@@ -186,7 +196,7 @@ class Train:
     position_index: int = 0  # index into line stations list
     progress: float = 0.0  # 0..1 between stations
     speed: float = 50.0  # pixels per second
-    capacity: int = 4
+    capacity: int = 6
     passengers: List[Passenger] = field(default_factory=list)
     direction: int = 1  # 1 forward, -1 backward
     carriages: int = 0
@@ -217,24 +227,6 @@ class Train:
                 remaining.append(p) # a passenger whose next_hop_id is not on this line will be left
 
         station.waiting = remaining
-        self.passengers.extend(to_take)
-        return len(to_take)
-
-    def initial_load(self, station: Station, line: Line):
-        """
-        Special loading logic for when a train is first placed.
-        It only picks up passengers whose destination is on the line.
-        """
-        cap = self.available_capacity()
-        if cap <= 0:
-            return 0
-        
-        line_stations = line.get_stations()
-        to_take = []
-        # In a more complex system, we'd check if a path exists. Here, we just check if the shape is on the line.
-        line_shapes = {s.shape for sid, s in station.parent_stations.items() if sid in line_stations}
-
-        station.remove_passengers_if(lambda p: p.dest_shape in line_shapes and len(to_take) < cap, to_take)
         self.passengers.extend(to_take)
         return len(to_take)
 
