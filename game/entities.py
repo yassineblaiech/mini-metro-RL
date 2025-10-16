@@ -9,6 +9,8 @@ ShapeType = str
 class Passenger:
     origin_id: int
     dest_shape: ShapeType
+    destination_id: int | None = None
+    next_hop_id: int | None = None # For multi-line journeys
     picked: bool = False
 
 @dataclass
@@ -21,6 +23,16 @@ class Station:
 
     def add_passenger(self, p: Passenger):
         self.waiting.append(p)
+
+    def remove_passengers_if(self, condition, out_list: list):
+        """Removes passengers that satisfy a condition and places them in out_list."""
+        kept = []
+        for p in self.waiting:
+            if condition(p):
+                out_list.append(p)
+            else:
+                kept.append(p)
+        self.waiting = kept
 
     def remove_passengers_for_shape(self, shape: ShapeType, count: int):
         taken = []
@@ -184,7 +196,7 @@ class Train:
     position_index: int = 0  # index into line stations list
     progress: float = 0.0  # 0..1 between stations
     speed: float = 50.0  # pixels per second
-    capacity: int = 4
+    capacity: int = 6
     passengers: List[Passenger] = field(default_factory=list)
     direction: int = 1  # 1 forward, -1 backward
     carriages: int = 0
@@ -196,46 +208,42 @@ class Train:
     def available_capacity(self):
         return max(0, self.effective_capacity() - len(self.passengers))
 
-    def load_passengers(self, station: Station):
-        # load passengers whose destination shape exists on the line (handled by caller)
-        cap = self.available_capacity()
-        if cap <= 0:
-            return 0
-        # take any passengers up to cap
-        to_take = []
-        remaining = []
-        for p in station.waiting:
-            if len(to_take) < cap and not p.picked:
-                p.picked = True
-                to_take.append(p)
-            else:
-                remaining.append(p)
-        station.waiting = remaining
-        self.passengers.extend(to_take)
-        return len(to_take)
-
-    def initial_load(self, station: Station, line: Line):
-        """
-        Special loading logic for when a train is first placed.
-        It only picks up passengers whose destination is on the line.
-        """
+    def load_passengers(self, station: Station, line: Line):
+        """Loads passengers from a station if their destination is on the given line."""
         cap = self.available_capacity()
         if cap <= 0:
             return 0
         
         line_stations = line.get_stations()
         to_take = []
-        # In a more complex system, we'd check if a path exists. Here, we just check if the shape is on the line.
-        line_shapes = {s.shape for sid, s in station.parent_stations.items() if sid in line_stations}
+        remaining = []
 
-        station.remove_passengers_if(lambda p: p.dest_shape in line_shapes and len(to_take) < cap, to_take)
+        for p in station.waiting:
+            # Only pick up if the passenger's next hop is on this line.
+            if p.next_hop_id in line_stations and len(to_take) < cap and not p.picked:
+                p.picked = True
+                to_take.append(p)
+            else:
+                remaining.append(p) # a passenger whose next_hop_id is not on this line will be left
+
+        station.waiting = remaining
         self.passengers.extend(to_take)
         return len(to_take)
 
     def drop_off(self, station: Station):
-        dropped = [p for p in self.passengers if p.dest_shape == station.shape]
-        self.passengers = [p for p in self.passengers if p.dest_shape != station.shape]
-        return len(dropped)
+        """Drops off passengers at their destination or an exchange station."""
+        delivered_count = 0
+        passengers_staying_on = []
+        for p in self.passengers:
+            if p.next_hop_id == station.id:
+                if p.destination_id == station.id:
+                    delivered_count += 1 # Final destination
+                else:
+                    station.add_passenger(p) # Dropped at exchange, re-add to waiting list
+            else:
+                passengers_staying_on.append(p)
+        self.passengers = passengers_staying_on
+        return delivered_count
 
 
 @dataclass

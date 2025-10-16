@@ -2,12 +2,16 @@ import pygame
 import random
 import time
 import math
+import heapq
 from typing import Dict, List, Tuple
 from .entities import Station, Passenger, Line, Train
-from .entities import Obstacle, Trail
+from .entities import Obstacle, Trail, ShapeType
+from .rendering import Renderer
 
 SHAPES = ['circle', 'square', 'triangle', 'pentagon']
 LINE_COLORS = [(220,20,60),(30,144,255),(34,139,34),(255,165,0),(148,0,211),(0,191,255)]
+# (Crimson), (Dodger Blue), (Forest Green), (Orange), (Dark Violet), (Deep Sky Blue)
+
 
 class Game:
     def __init__(self, window_size=(960,640)):
@@ -17,6 +21,7 @@ class Game:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.SysFont('Arial', 16)
         self.running = True
+        self.game_over = False
         self.paused = False
 
         self.stations: Dict[int, Station] = {}
@@ -49,19 +54,37 @@ class Game:
         self.dragging_tool = None
         self.pending_train_placement = None # stores {'line_id': int, 'trail': Trail}
 
+        # Caches for performance
+        self.line_station_shapes: Dict[int, set] = {}
+        self.station_lines: Dict[int, List[int]] = {}
+        self.exchange_stations: set[int] = set()
 
         self.init_map()
+        self.renderer = Renderer(self.screen, self.font)
 
     def init_map(self):
         # create some initial stations placed randomly but not overlapping too much
         w,h = self.screen.get_size()
         margin = 60
-        for i in range(8):
+        min_station_dist = 50 # Minimum distance between stations
+        attempts = 0
+        while len(self.stations) < 8 and attempts < 1000: # Limit attempts to avoid infinite loop
+            attempts += 1
             x = random.randint(margin, w - self.sidebar_width - margin)
             y = random.randint(margin, h-margin)
-            s = Station(id=self.next_station_id, pos=(x,y), shape=random.choice(SHAPES))
-            self.stations[self.next_station_id] = s
-            self.next_station_id += 1
+            
+            # Check distance to other stations
+            too_close = False
+            for s_existing in self.stations.values():
+                dist = math.hypot(x - s_existing.pos[0], y - s_existing.pos[1])
+                if dist < min_station_dist:
+                    too_close = True
+                    break
+            
+            if not too_close:
+                s = Station(id=self.next_station_id, pos=(x,y), shape=random.choice(SHAPES))
+                self.stations[self.next_station_id] = s
+                self.next_station_id += 1
         # generate a few convex obstacles (rivers/lakes) smaller than 10% of map area and not containing stations
         w,h = self.screen.get_size()
         map_area = w * h
@@ -94,13 +117,32 @@ class Game:
 
     def spawn_passenger(self):
         # spawn at random station with random dest shape (not same as origin shape)
-        s = random.choice(list(self.stations.values()))
-        dest_shape = random.choice(SHAPES)
-        # avoid same shape destination
-        if dest_shape == s.shape:
-            dest_shape = random.choice([sh for sh in SHAPES if sh != s.shape])
-        p = Passenger(origin_id=s.id, dest_shape=dest_shape)
-        s.add_passenger(p)
+        origin_station = random.choice(list(self.stations.values()))
+        
+        # Find all possible destination shapes (not the origin's shape)
+        possible_dest_shapes = [sh for sh in SHAPES if sh != origin_station.shape]
+        if not possible_dest_shapes: return # Should not happen with >1 shape
+        
+        dest_shape = random.choice(possible_dest_shapes)
+
+        # Find all stations on the map that match the destination shape
+        valid_destinations = [
+            s for s in self.stations.values() if s.shape == dest_shape
+        ]
+
+        if not valid_destinations:
+            # This can happen if no station of the chosen shape exists on the map yet.
+            return
+
+        # Find the closest valid destination station by Euclidean distance.
+        # The pathfinding logic will handle whether the passenger can actually be picked up.
+        closest_dest_station = min(valid_destinations,
+            key=lambda s: math.hypot(s.pos[0] - origin_station.pos[0], s.pos[1] - origin_station.pos[1]))
+        p = Passenger(origin_id=origin_station.id, dest_shape=dest_shape, destination_id=closest_dest_station.id, next_hop_id=closest_dest_station.id)
+        origin_station.add_passenger(p)
+
+        # After spawning, we need to recalculate this passenger's route
+        self.update_passenger_routes_at_station(origin_station)
 
     def handle_events(self):
         for ev in pygame.event.get():
@@ -181,11 +223,19 @@ class Game:
                                 station_b_id = clicked.id
 
                                 if station_a_id != station_b_id:
-                                    # Find the line that contains both stations
-                                    line_a = self.find_line_with_station(station_a_id)
-                                    line_b = self.find_line_with_station(station_b_id)
-                                    if line_a is not None and line_a == line_b:
-                                        self.lines[line_a].remove_trail(station_a_id, station_b_id)
+                                    # Find a line that has a trail directly connecting the two stations
+                                    line_to_modify = None
+                                    for line in self.lines.values():
+                                        for trail in line.trails:
+                                            if (trail.station_a == station_a_id and trail.station_b == station_b_id) or \
+                                               (trail.station_a == station_b_id and trail.station_b == station_a_id):
+                                                line_to_modify = line
+                                                break
+                                        if line_to_modify:
+                                            break
+                                    if line_to_modify:
+                                        line_to_modify.remove_trail(station_a_id, station_b_id)
+                                        self.update_exchange_caches(line_to_modify)
 
                                 # Reset for the next operation.
                                 self.first_station_for_trail = None
@@ -309,8 +359,91 @@ class Game:
 
         # Perform initial passenger pickup
         start_station = self.stations[start_station_id]
-        tr.load_passengers(start_station)
+        tr.load_passengers(start_station, line)
     
+    def find_shortest_path_distance(self, start_id: int, end_id: int) -> float:
+        """
+        Calculates the shortest travel distance (in pixels) between two stations using Dijkstra's algorithm.
+        Returns float('inf') if no path exists.
+        """
+        if start_id == end_id:
+            return 0
+
+        distances = {station_id: float('inf') for station_id in self.stations}
+        distances[start_id] = 0
+        
+        pq = [(0, start_id)]  # (distance, station_id)
+
+        while pq:
+            current_dist, current_id = heapq.heappop(pq)
+
+            if current_dist > distances[current_id]:
+                continue
+
+            if current_id == end_id:
+                return current_dist
+
+            # Find all neighbors of the current station across all lines it's on
+            for line_id in self.station_lines.get(current_id, []):
+                line = self.lines[line_id]
+                for neighbor_id in line.get_neighbors(current_id):
+                    # Calculate the pixel distance of this trail
+                    edge_dist = math.hypot(self.stations[current_id].pos[0] - self.stations[neighbor_id].pos[0],
+                                          self.stations[current_id].pos[1] - self.stations[neighbor_id].pos[1])
+                    
+                    if distances[current_id] + edge_dist < distances[neighbor_id]:
+                        distances[neighbor_id] = distances[current_id] + edge_dist
+                        heapq.heappush(pq, (distances[neighbor_id], neighbor_id))
+        
+        return float('inf') # No path found
+
+    def update_exchange_caches(self, changed_line: Line | None = None):
+        """Recalculates caches for line shapes and exchange stations. Can be optimized to update only changed lines."""
+        self.station_lines.clear()
+        for line_id, line in self.lines.items():
+            line_stations = line.get_stations()
+            # Cache shapes per line
+            self.line_station_shapes[line_id] = {self.stations[sid].shape for sid in line_stations}
+            # Cache lines per station
+            for station_id in line_stations:
+                self.station_lines.setdefault(station_id, []).append(line_id)
+        
+        # Identify exchange stations (stations on more than one line)
+        self.exchange_stations = {sid for sid, lines in self.station_lines.items() if len(lines) > 1}
+
+        # After updating caches, all passenger routes might need re-evaluation
+        for station in self.stations.values():
+            self.update_passenger_routes_at_station(station)
+
+    def update_passenger_routes_at_station(self, station: Station):
+        """For each passenger at a station, determine their best next hop."""
+        station_line_ids = self.station_lines.get(station.id, [])
+        if not station_line_ids: # Stranded station
+            for p in station.waiting:
+                p.next_hop_id = None # Nowhere to go
+            return
+
+        for p in station.waiting:
+            p.picked = False # Reset picked status when re-evaluating route
+            # Check if destination is on any of the lines serving the current station
+            can_reach_directly = any(p.dest_shape in self.line_station_shapes.get(lid, set()) for lid in station_line_ids)
+            if can_reach_directly:
+                p.next_hop_id = p.destination_id
+                continue
+
+            # Find the closest exchange station that leads to a line with the destination shape
+            best_exchange = None
+            min_dist = float('inf')
+            for exchange_id in self.exchange_stations:
+                # Is this exchange reachable from the current station?
+                if any(exchange_id in self.lines[lid].get_stations() for lid in station_line_ids):
+                    # Does this exchange connect to a line that has the required shape?
+                    if any(p.dest_shape in self.line_station_shapes.get(other_lid, set()) for other_lid in self.station_lines.get(exchange_id, [])):
+                        p.next_hop_id = exchange_id # Found a valid exchange path
+                        break # Simple approach: take the first valid one found. More complex could find closest.
+            else: # No exchange path found
+                p.next_hop_id = None
+
     def update(self, dt):
         # If paused, we only process a delta time of 0 to freeze game state
         # but we still run the loop to check for game over conditions.
@@ -351,7 +484,7 @@ class Game:
 
                 # pick up if capacity
                 if tr.available_capacity() > 0:
-                    tr.load_passengers(s_to)
+                    tr.load_passengers(s_to, line)
 
                 # AI: Choose next station
                 tr.target_station_id = self.choose_next_station(tr, line, last_station_id)
@@ -359,7 +492,7 @@ class Game:
         # overcrowding check
         for s in self.stations.values():
             if len(s.waiting) > 12:
-                # game over
+                self.game_over = True
                 self.running = False
 
     def choose_next_station(self, train: Train, line: Line, last_station_id: int) -> int | None:
@@ -382,12 +515,12 @@ class Game:
 
         # If there are passengers, try to find a path that serves them.
         if train.passengers:
-            passenger_dests = {p.dest_shape for p in train.passengers}
+            passenger_dests = {p.next_hop_id for p in train.passengers}
             
             best_path = None
             for path_station_id in potential_paths:
                 # Simple check: does this immediate neighbor match a destination?
-                if self.stations[path_station_id].shape in passenger_dests:
+                if path_station_id in passenger_dests:
                     return path_station_id # Greedily go to the matching station
 
             # More advanced: Do a quick search down each path to see if it contains a destination shape.
@@ -419,192 +552,9 @@ class Game:
             self.lines[self.next_line_id] = target_line
             self.next_line_id += 1
 
-        target_line.add_trail(new_trail)
-
-    def draw_station(self, s: Station):
-        x,y = s.pos
-        color = (200,200,200)
-        pygame.draw.circle(self.screen, (40,40,40), (x,y), 16, 2)
-        # draw shape symbol
-        if s.shape == 'circle':
-            pygame.draw.circle(self.screen, (200,40,40), (x,y), 6)
-        elif s.shape == 'square':
-            pygame.draw.rect(self.screen, (40,200,40), (x-6,y-6,12,12))
-        elif s.shape == 'triangle':
-            points = [(x,y-7),(x-6,y+6),(x+6,y+6)]
-            pygame.draw.polygon(self.screen, (40,40,200), points)
-        elif s.shape == 'pentagon':
-            pts = []
-            for i in range(5):
-                a = -math.pi/2 + i*2*math.pi/5
-                pts.append((x+6*math.cos(a), y+6*math.sin(a)))
-            pygame.draw.polygon(self.screen, (200,140,40), pts)
-        # draw waiting count
-        txt = self.font.render(str(len(s.waiting)), True, (0,0,0))
-        self.screen.blit(txt, (x-10,y+18))
-
-    def draw_line(self, line: Line):
-        if line.trails:
-            # draw thicker line but make it discontinuous where it crosses obstacles
-            seg_width = 6
-            for trail in line.trails:
-                s1 = self.stations.get(trail.station_a)
-                s2 = self.stations.get(trail.station_b)
-                x1, y1 = s1.pos
-                x2, y2 = s2.pos
-                seg_len = math.hypot(x2-x1, y2-y1)
-                if seg_len == 0:
-                    continue
-                # split segment into small pieces
-                piece = 12
-                d = 0.0
-                while d < seg_len:
-                    t1 = d/seg_len
-                    t2 = min((d+piece)/seg_len, 1.0)
-                    sx = x1 + (x2-x1)*t1
-                    sy = y1 + (y2-y1)*t1
-                    ex = x1 + (x2-x1)*t2
-                    ey = y1 + (y2-y1)*t2
-                    # check midpoint against obstacles
-                    mx = (sx+ex)/2
-                    my = (sy+ey)/2
-                    inside_any = False
-                    for ob in self.obstacles.values():
-                        if ob.contains_point((int(mx), int(my))):
-                            inside_any = True
-                            break
-                    if not inside_any:
-                        pygame.draw.line(self.screen, line.color, (int(sx),int(sy)), (int(ex),int(ey)), seg_width)
-                    d += piece
-            # draw bridge overlay if applicable (lighter dashed overlay)
-            if line.has_bridge:
-                for trail in line.trails:
-                    s1 = self.stations.get(trail.station_a)
-                    s2 = self.stations.get(trail.station_b)
-                    x1, y1 = s1.pos
-                    x2, y2 = s2.pos
-                    seg_len = int(math.hypot(x2-x1, y2-y1))
-                    d = 0
-                    while d < seg_len:
-                        t1 = d/seg_len
-                        t2 = min((d+12)/seg_len,1.0)
-                        sx = int(x1 + (x2-x1)*t1)
-                        sy = int(y1 + (y2-y1)*t1)
-                        ex = int(x1 + (x2-x1)*t2)
-                        ey = int(y1 + (y2-y1)*t2)
-                        pygame.draw.line(self.screen, (220,220,220), (sx,sy), (ex,ey), 3)
-                        d += 24
-
-    def draw_train(self, tr: Train):
-        line = self.lines.get(tr.line_id)
-        station_sequence = line.station_sequence() if line else []
-        if not line or not tr.current_station_id or not tr.target_station_id:
-            return
-        s_from = self.stations[tr.current_station_id]
-        s_to = self.stations[tr.target_station_id]
-        fx,fy = s_from.pos
-        tx,ty = s_to.pos
-        x = fx + (tx-fx)*tr.progress
-        y = fy + (ty-fy)*tr.progress
-        # draw rectangle for train
-        w,h = 18,10
-        angle = math.atan2(ty-fy, tx-fx)
-        surf = pygame.Surface((w,h), pygame.SRCALPHA)
-        surf.fill((0,0,0))
-        pygame.draw.rect(surf, (50,50,50), (0,0,w,h))
-        rot = pygame.transform.rotate(surf, -math.degrees(angle))
-        rx = x - rot.get_width()/2
-        ry = y - rot.get_height()/2
-        self.screen.blit(rot, (rx,ry))
-        txt = self.font.render(str(len(tr.passengers)), True, (255,255,255))
-        self.screen.blit(txt, (x-6,y-6))
-
-    def draw_ui(self):
-        txt = self.font.render(f'Score: {self.score}  Trains: {len(self.trains)}  Lines: {len(self.lines)}', True, (0,0,0))
-        self.screen.blit(txt, (8,8))
-        ox = self.screen.get_width() - 200
-        oy = 40
-        for ob in self.obstacles.values():
-            txt_o = self.font.render('Obstacle (needs bridge/tunnel)', True, (0,0,0))
-            self.screen.blit(txt_o, (ox, oy))
-            break
-        if self.paused:
-            p = self.font.render('PAUSED', True, (200,0,0))
-            self.screen.blit(p, (self.screen.get_width()-80, 8))
-        # draw the sidebar visuals
-        self.draw_sidebar()
-
-        # Draw preview line if we are in the middle of creating a trail
-        if self.first_station_for_trail is not None and self.temp_mouse_pos is not None:
-            start_pos = self.stations[self.first_station_for_trail].pos
-            end_pos = self.temp_mouse_pos
-            preview_color = self.selected_color
-            if self.selected_tool == 'remove':
-                preview_color = (128, 128, 128)
-            pygame.draw.line(self.screen, preview_color, start_pos, end_pos, 4)
-        
-        # Draw dragged locomotive icon
-        if self.dragging_tool == 'locomotive' and self.temp_mouse_pos:
-            icon_x, icon_y = self.temp_mouse_pos
-            pygame.draw.rect(self.screen, (70,70,70), (icon_x-10, icon_y-6, 20, 12))
-            pygame.draw.circle(self.screen, (30,30,30), (icon_x-4, icon_y+8), 3)
-            pygame.draw.circle(self.screen, (30,30,30), (icon_x+6, icon_y+8), 3)
-
-        # Draw direction selection prompt
-        if self.pending_train_placement:
-            trail = self.pending_train_placement['trail']
-            s1 = self.stations[trail.station_a]
-            s2 = self.stations[trail.station_b]
-            pygame.draw.circle(self.screen, (255, 255, 0), s1.pos, 20, 4) # Yellow highlight
-            pygame.draw.circle(self.screen, (255, 255, 0), s2.pos, 20, 4) # Yellow highlight
-
-    def draw_sidebar(self):
-        sx = self.screen.get_width() - self.sidebar_width
-        pygame.draw.rect(self.screen, (245,245,245), (sx, 0, self.sidebar_width, self.screen.get_height()))
-        t = self.font.render('Tools', True, (20,20,20))
-        self.screen.blit(t, (sx+12, 6))
-        y = 30
-        for idx,c in enumerate(self.available_colors[:6]):
-            cx = sx + 20 + (idx%2)*28
-            cy = y + (idx//2)*28
-            pygame.draw.circle(self.screen, c, (cx,cy), 12)
-            if c == self.selected_color:
-                pygame.draw.circle(self.screen, (0,0,0), (cx,cy), 14, 2)
-        # tools
-        tools_y = 140
-        for i,tname in enumerate(self.tools):
-            tx = sx + 12
-            ty = tools_y + i*44
-            rect = (tx, ty, self.sidebar_width-24, 36)
-            # highlight selected tool
-            if tname == self.selected_tool:
-                pygame.draw.rect(self.screen, (220,230,255), rect)
-                pygame.draw.rect(self.screen, (80,120,200), rect, 2)
-            else:
-                pygame.draw.rect(self.screen, (235,235,235), rect)
-            # draw icon for tool
-            icon_x = tx + 8
-            icon_y = ty + 18
-            if tname == 'line':
-                pygame.draw.circle(self.screen, self.selected_color, (icon_x, icon_y), 8)
-            elif tname == 'remove':
-                # Red 'X' icon for remove tool
-                pygame.draw.line(self.screen, (200, 0, 0), (icon_x - 6, icon_y - 6), (icon_x + 6, icon_y + 6), 3)
-                pygame.draw.line(self.screen, (200, 0, 0), (icon_x - 6, icon_y + 6), (icon_x + 6, icon_y - 6), 3)
-            elif tname == 'locomotive':
-                # small train icon (rectangle + wheel)
-                pygame.draw.rect(self.screen, (70,70,70), (icon_x-10, ty+8, 20, 12))
-                pygame.draw.circle(self.screen, (30,30,30), (icon_x-4, ty+22), 3)
-                pygame.draw.circle(self.screen, (30,30,30), (icon_x+6, ty+22), 3)
-            elif tname == 'carriage':
-                pygame.draw.rect(self.screen, (120,80,40), (icon_x-10, ty+8, 20, 12))
-                pygame.draw.circle(self.screen, (30,30,30), (icon_x-4, ty+22), 3)
-            elif tname == 'interchange':
-                # star-like upgrade icon
-                pygame.draw.polygon(self.screen, (200,160,0), [(icon_x, ty+6),(icon_x+4, ty+14),(icon_x-4, ty+10),(icon_x+4, ty+10),(icon_x-4, ty+14)])
-            # label
-            lbl = self.font.render(tname.capitalize(), True, (10,10,10))
-            self.screen.blit(lbl, (tx+40, ty+8))
+        if target_line.can_add_trail(new_trail):
+            target_line.add_trail(new_trail)
+            self.update_exchange_caches(target_line)
 
     def run(self):
         last = time.time()
@@ -614,25 +564,13 @@ class Game:
             last = now
             self.handle_events()
             self.update(dt)
-            self.screen.fill((240,240,240))
-            # draw lines
-            for line in self.lines.values():
-                self.draw_line(line)
-            # draw obstacles (between lines and stations)
-            for ob in self.obstacles.values():
-                pygame.draw.polygon(self.screen, (180,200,255), ob.points)
-                pygame.draw.polygon(self.screen, (90,120,160), ob.points, 2)
-            # draw stations
-            for s in self.stations.values():
-                self.draw_station(s)
-            # draw trains
-            for tr in self.trains.values():
-                self.draw_train(tr)
-            
-            # UI must be drawn last to be on top
-            self.draw_ui()
-            pygame.display.flip()
+            self.renderer.draw(self)
             self.clock.tick(60)
+        
+        if self.game_over:
+            self.show_game_over_screen()
+
+    def show_game_over_screen(self):
         # game over screen
         self.screen.fill((30,30,30))
         go = self.font.render('GAME OVER - press ESC or close window', True, (255,255,255))
