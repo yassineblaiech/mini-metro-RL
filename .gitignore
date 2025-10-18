@@ -1,0 +1,58 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# --- Virtual environment ---
+env/
+venv/
+.venv/
+
+# --- IDE / Editors ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- Logs / OS files ---
+*.log
+.DS_Store
+Thumbs.db
+
+# --- Testing / Coverage ---
+.coverage
+.tox/
+nosetests.xml
+pytest_cache/
+.pytest_cache/
+htmlcov/
+.coverage.*
+.cache/
+
+# --- Temporary runtime files ---
+*.tmp
+*.bak
+*.orig
+
+# --- Custom project paths ---
+# Ignore compiled cache in submodules
+game/__pycache__/
+
+# --- Pygame window captures / screenshots (if any) ---
+*.png
+*.jpg
+*.gif
+
+# --- Bytecode or profiling dumps ---
+*.prof
+*.dat
