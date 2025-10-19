@@ -19,9 +19,13 @@ class Renderer:
         """The main drawing method, called every frame."""
         self.screen.fill((240, 240, 240))
 
+        # Calculate shared segments for parallel line rendering
+        from .game_logic import find_shared_segments
+        shared_segments = find_shared_segments(game.lines)
+
         # Draw game world elements
-        for line in game.lines.values():
-            self.draw_line(line, game.stations, game.obstacles)
+        for line_id, line in game.lines.items():
+            self.draw_line(line, line_id, game.stations, game.obstacles, shared_segments)
         
         for ob in game.obstacles.values():
             pygame.draw.polygon(self.screen, (180, 200, 255), ob.points)
@@ -38,23 +42,31 @@ class Renderer:
 
         pygame.display.flip()
 
+    def _get_shape_draw_info(self, shape: str) -> dict:
+        """Returns drawing info (color, drawing function) for a shape."""
+        shape_map = {
+            'circle': {'color': (200, 40, 40), 'draw_func': pygame.draw.circle},
+            'square': {'color': (40, 200, 40), 'draw_func': lambda s, c, p, sz: pygame.draw.rect(s, c, (p[0] - sz, p[1] - sz, sz * 2, sz * 2))},
+            'triangle': {'color': (40, 40, 200), 'draw_func': lambda s, c, p, sz: pygame.draw.polygon(s, c, [(p[0], p[1] - sz), (p[0] - sz, p[1] + sz), (p[0] + sz, p[1] + sz)])},
+            'pentagon': {'color': (200, 140, 40), 'draw_func': self._draw_polygon_shape}
+        }
+        return shape_map.get(shape)
+
+    def _draw_polygon_shape(self, surface, color, center, size, sides=5):
+        """Helper to draw a regular polygon."""
+        pts = []
+        for i in range(sides):
+            angle = -math.pi / 2 + i * 2 * math.pi / sides
+            pts.append((center[0] + size * math.cos(angle), center[1] + size * math.sin(angle)))
+        pygame.draw.polygon(surface, color, pts)
+
     def draw_station(self, s: Station):
         x, y = s.pos
         pygame.draw.circle(self.screen, (40, 40, 40), (x, y), 16, 2)
         # draw shape symbol
-        if s.shape == 'circle':
-            pygame.draw.circle(self.screen, (200, 40, 40), (x, y), 6)
-        elif s.shape == 'square':
-            pygame.draw.rect(self.screen, (40, 200, 40), (x - 6, y - 6, 12, 12))
-        elif s.shape == 'triangle':
-            points = [(x, y - 7), (x - 6, y + 6), (x + 6, y + 6)]
-            pygame.draw.polygon(self.screen, (40, 40, 200), points)
-        elif s.shape == 'pentagon':
-            pts = []
-            for i in range(5):
-                a = -math.pi / 2 + i * 2 * math.pi / 5
-                pts.append((x + 6 * math.cos(a), y + 6 * math.sin(a)))
-            pygame.draw.polygon(self.screen, (200, 140, 40), pts)
+        draw_info = self._get_shape_draw_info(s.shape)
+        if draw_info:
+            draw_info['draw_func'](self.screen, draw_info['color'], (x, y), 6 if s.shape != 'triangle' else 7)
 
         # Draw waiting passengers as small shapes
         passenger_icon_size = 4
@@ -68,77 +80,159 @@ class Renderer:
             col = i % row_length
             px = start_x + col * spacing
             py = start_y + row * spacing
+            draw_info = self._get_shape_draw_info(p.dest_shape)
+            if draw_info:
+                draw_info['draw_func'](self.screen, draw_info['color'], (px, py), passenger_icon_size)
 
-            if p.dest_shape == 'circle':
-                pygame.draw.circle(self.screen, (200, 40, 40), (px, py), passenger_icon_size) # Red color for circle shape
-            elif p.dest_shape == 'square':
-                pygame.draw.rect(self.screen, (40, 200, 40), (px - passenger_icon_size, py - passenger_icon_size, passenger_icon_size * 2, passenger_icon_size * 2)) # Green color for square shape
-            elif p.dest_shape == 'triangle':
-                points = [(px, py - passenger_icon_size), (px - passenger_icon_size, py + passenger_icon_size), (px + passenger_icon_size, py + passenger_icon_size)]
-                pygame.draw.polygon(self.screen, (0, 0, 200), points) # Blue color for triangle shape
-            elif p.dest_shape == 'pentagon':
-                pts = []
-                for j in range(5):
-                    a = -math.pi / 2 + j * 2 * math.pi / 5
-                    pts.append((px + passenger_icon_size * math.cos(a), py + passenger_icon_size * math.sin(a)))
-                pygame.draw.polygon(self.screen, (200, 140, 40), pts) # Orange color for pentagon shape
-
-    def draw_line(self, line: Line, stations, obstacles):
+    def draw_line(self, line: Line, line_id: int, stations, obstacles, shared_segments):
         if not line.trails:
             return
-            
+
+        from .game_logic import calculate_line_offset_for_segment, offset_waypoints
+
         seg_width = 6
         for trail in line.trails:
-            s1 = stations.get(trail.station_a)
-            s2 = stations.get(trail.station_b)
-            x1, y1 = s1.pos
-            x2, y2 = s2.pos
-            seg_len = math.hypot(x2 - x1, y2 - y1)
-            if seg_len == 0:
-                continue
-            
-            piece = 12
-            d = 0.0
-            while d < seg_len:
-                t1 = d / seg_len
-                t2 = min((d + piece) / seg_len, 1.0)
-                sx, sy = x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1
-                ex, ey = x1 + (x2 - x1) * t2, y1 + (y2 - y1) * t2
-                mx, my = (sx + ex) / 2, (sy + ey) / 2
-                
-                inside_any = any(ob.contains_point((int(mx), int(my))) for ob in obstacles.values())
-                if not inside_any:
-                    pygame.draw.line(self.screen, line.color, (int(sx), int(sy)), (int(ex), int(ey)), seg_width)
-                d += piece
+            # Use waypoints for orthogonal/diagonal rendering
+            waypoints = trail.waypoints if trail.waypoints else [stations[trail.station_a].pos, stations[trail.station_b].pos]
+
+            # Calculate offset for this segment if it's shared
+            segment_key = tuple(sorted([trail.station_a, trail.station_b]))
+            offset_distance = calculate_line_offset_for_segment(line_id, segment_key, shared_segments)
+
+            # Apply offset to waypoints if needed
+            if abs(offset_distance) > 0.1:
+                render_waypoints = offset_waypoints(waypoints, offset_distance)
+            else:
+                render_waypoints = waypoints
+
+            # Draw each segment between consecutive waypoints
+            for i in range(len(render_waypoints) - 1):
+                x1, y1 = render_waypoints[i]
+                x2, y2 = render_waypoints[i + 1]
+                seg_len = math.hypot(x2 - x1, y2 - y1)
+                if seg_len == 0:
+                    continue
+
+                piece = 12
+                d = 0.0
+                while d < seg_len:
+                    t1 = d / seg_len
+                    t2 = min((d + piece) / seg_len, 1.0)
+                    sx, sy = x1 + (x2 - x1) * t1, y1 + (y2 - y1) * t1
+                    ex, ey = x1 + (x2 - x1) * t2, y1 + (y2 - y1) * t2
+                    mx, my = (sx + ex) / 2, (sy + ey) / 2
+
+                    inside_any = any(ob.contains_point((int(mx), int(my))) for ob in obstacles.values())
+                    if not inside_any:
+                        pygame.draw.line(self.screen, line.color, (int(sx), int(sy)), (int(ex), int(ey)), seg_width)
+                    d += piece
 
         if line.has_bridge:
             for trail in line.trails:
-                s1 = stations.get(trail.station_a)
-                s2 = stations.get(trail.station_b)
-                x1, y1 = s1.pos
-                x2, y2 = s2.pos
-                seg_len = int(math.hypot(x2 - x1, y2 - y1))
-                d = 0
-                while d < seg_len:
-                    t1, t2 = d / seg_len, min((d + 12) / seg_len, 1.0)
-                    sx, sy = int(x1 + (x2 - x1) * t1), int(y1 + (y2 - y1) * t1)
-                    ex, ey = int(x1 + (x2 - x1) * t2), int(y1 + (y2 - y1) * t2)
-                    pygame.draw.line(self.screen, (220, 220, 220), (sx, sy), (ex, ey), 3)
-                    d += 24
+                waypoints = trail.waypoints if trail.waypoints else [stations[trail.station_a].pos, stations[trail.station_b].pos]
+
+                # Calculate offset for bridge marks too
+                segment_key = tuple(sorted([trail.station_a, trail.station_b]))
+                offset_distance = calculate_line_offset_for_segment(line_id, segment_key, shared_segments)
+
+                if abs(offset_distance) > 0.1:
+                    render_waypoints = offset_waypoints(waypoints, offset_distance)
+                else:
+                    render_waypoints = waypoints
+
+                # Draw bridge marks on each segment
+                for i in range(len(render_waypoints) - 1):
+                    x1, y1 = render_waypoints[i]
+                    x2, y2 = render_waypoints[i + 1]
+                    seg_len = int(math.hypot(x2 - x1, y2 - y1))
+                    d = 0
+                    while d < seg_len:
+                        t1, t2 = d / seg_len, min((d + 12) / seg_len, 1.0)
+                        sx, sy = int(x1 + (x2 - x1) * t1), int(y1 + (y2 - y1) * t1)
+                        ex, ey = int(x1 + (x2 - x1) * t2), int(y1 + (y2 - y1) * t2)
+                        pygame.draw.line(self.screen, (220, 220, 220), (sx, sy), (ex, ey), 3)
+                        d += 24
 
     def draw_train(self, tr: Train, game: 'Game'):
         if not tr.line_id or not tr.current_station_id or not tr.target_station_id:
             return
-            
+
+        # Get the trail and waypoints
+        line = game.lines.get(tr.line_id)
+        if not line:
+            return
+
+        trail = line.get_trail_between(tr.current_station_id, tr.target_station_id)
+        if not trail:
+            return
+
         s_from = game.stations[tr.current_station_id]
         s_to = game.stations[tr.target_station_id]
-        fx, fy = s_from.pos
-        tx, ty = s_to.pos
-        x = fx + (tx - fx) * tr.progress
-        y = fy + (ty - fy) * tr.progress
-        
+
+        # Get waypoints for this trail
+        waypoints = trail.waypoints if trail.waypoints else [s_from.pos, s_to.pos]
+
+        # Ensure waypoints are in correct direction (from current_station to target_station)
+        # The trail stores waypoints from station_a to station_b, but train might go b to a
+        if trail.station_a == tr.current_station_id:
+            # Train going station_a → station_b, waypoints are correct
+            pass
+        elif trail.station_b == tr.current_station_id:
+            # Train going station_b → station_a, reverse waypoints
+            waypoints = list(reversed(waypoints))
+        else:
+            # Fallback: check endpoints
+            if waypoints[0] != s_from.pos and waypoints[-1] == s_from.pos:
+                waypoints = list(reversed(waypoints))
+
+        # Calculate offset for parallel lines
+        from .game_logic import find_shared_segments, calculate_line_offset_for_segment, offset_waypoints
+        shared_segments = find_shared_segments(game.lines)
+        segment_key = tuple(sorted([trail.station_a, trail.station_b]))
+        offset_distance = calculate_line_offset_for_segment(tr.line_id, segment_key, shared_segments)
+
+        # Apply offset to waypoints if on a shared segment
+        if abs(offset_distance) > 0.1:
+            render_waypoints = offset_waypoints(waypoints, offset_distance)
+        else:
+            render_waypoints = waypoints
+
+        # Calculate total distance along the offset path
+        total_distance = 0.0
+        segment_lengths = []
+        for i in range(len(render_waypoints) - 1):
+            x1, y1 = render_waypoints[i]
+            x2, y2 = render_waypoints[i + 1]
+            seg_len = math.hypot(x2 - x1, y2 - y1)
+            segment_lengths.append(seg_len)
+            total_distance += seg_len
+
+        if total_distance == 0:
+            x, y = s_from.pos
+            angle = 0
+        else:
+            # Find which segment the train is on based on progress
+            target_distance = tr.progress * total_distance
+            accumulated_dist = 0.0
+            current_segment = 0
+            segment_progress = 0.0
+
+            for i, seg_len in enumerate(segment_lengths):
+                if accumulated_dist + seg_len >= target_distance:
+                    current_segment = i
+                    if seg_len > 0:
+                        segment_progress = (target_distance - accumulated_dist) / seg_len
+                    break
+                accumulated_dist += seg_len
+
+            # Interpolate position within the current segment (using offset waypoints)
+            x1, y1 = render_waypoints[current_segment]
+            x2, y2 = render_waypoints[current_segment + 1]
+            x = x1 + (x2 - x1) * segment_progress
+            y = y1 + (y2 - y1) * segment_progress
+            angle = math.atan2(y2 - y1, x2 - x1)
+
         w, h = 18, 10
-        angle = math.atan2(ty - fy, tx - fx)
         surf = pygame.Surface((w, h), pygame.SRCALPHA)
         pygame.draw.rect(surf, (50, 50, 50), (0, 0, w, h)) # Draw the train body
 
@@ -169,19 +263,9 @@ class Renderer:
 
     def _draw_passenger_shape_on_surface(self, surface: pygame.Surface, shape: str, x: int, y: int, size: int):
         """Helper to draw a passenger shape on a specific surface."""
-        if shape == 'circle':
-            pygame.draw.circle(surface, (200, 40, 40), (x, y), size)
-        elif shape == 'square':
-            pygame.draw.rect(surface, (40, 200, 40), (x - size, y - size, size * 2, size * 2))
-        elif shape == 'triangle':
-            points = [(x, y - size), (x - size, y + size), (x + size, y + size)]
-            pygame.draw.polygon(surface, (40, 40, 200), points)
-        elif shape == 'pentagon':
-            pts = []
-            for j in range(5):
-                a = -math.pi / 2 + j * 2 * math.pi / 5
-                pts.append((x + size * math.cos(a), y + size * math.sin(a)))
-            pygame.draw.polygon(surface, (200, 140, 40), pts)
+        draw_info = self._get_shape_draw_info(shape)
+        if draw_info:
+            draw_info['draw_func'](surface, draw_info['color'], (x, y), size)
 
     def draw_ui(self, game: 'Game'):
         txt = self.font.render(f'Score: {game.score}  Trains: {len(game.trains)}  Lines: {len(game.lines)}', True, (0, 0, 0))
@@ -195,12 +279,38 @@ class Renderer:
         self.draw_sidebar(game)
 
         if game.first_station_for_trail is not None and game.temp_mouse_pos is not None:
-            start_pos = game.stations[game.first_station_for_trail].pos
-            end_pos = game.temp_mouse_pos
+            from .game_logic import calculate_orthogonal_path
             preview_color = game.selected_color
             if game.selected_tool == 'remove':
                 preview_color = (128, 128, 128)
-            pygame.draw.line(self.screen, preview_color, start_pos, end_pos, 4)
+
+            # Draw preview path
+            if game.is_dragging_line and len(game.intermediate_stations) > 1:
+                # Show preview of all segments being created
+                for i in range(len(game.intermediate_stations) - 1):
+                    start_pos = game.stations[game.intermediate_stations[i]].pos
+                    end_pos = game.stations[game.intermediate_stations[i + 1]].pos
+                    waypoints = calculate_orthogonal_path(start_pos, end_pos)
+                    for j in range(len(waypoints) - 1):
+                        pygame.draw.line(self.screen, preview_color, waypoints[j], waypoints[j + 1], 4)
+
+                # Draw preview from last intermediate station to mouse cursor
+                last_station = game.stations[game.intermediate_stations[-1]]
+                waypoints = calculate_orthogonal_path(last_station.pos, game.temp_mouse_pos)
+                for i in range(len(waypoints) - 1):
+                    pygame.draw.line(self.screen, preview_color, waypoints[i], waypoints[i + 1], 4)
+
+                # Highlight intermediate stations
+                for station_id in game.intermediate_stations:
+                    station = game.stations[station_id]
+                    pygame.draw.circle(self.screen, preview_color, station.pos, 20, 3)
+            else:
+                # Original preview (non-drag or first click)
+                start_pos = game.stations[game.first_station_for_trail].pos
+                end_pos = game.temp_mouse_pos
+                waypoints = calculate_orthogonal_path(start_pos, end_pos)
+                for i in range(len(waypoints) - 1):
+                    pygame.draw.line(self.screen, preview_color, waypoints[i], waypoints[i + 1], 4)
 
         if game.dragging_tool == 'locomotive' and game.temp_mouse_pos:
             icon_x, icon_y = game.temp_mouse_pos

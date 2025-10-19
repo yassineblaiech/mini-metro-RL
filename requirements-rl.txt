@@ -1,0 +1,19 @@
+# Additional requirements for RL training
+# Install with: pip install -r requirements-rl.txt
+
+# Stable-Baselines3 (recommended for beginners)
+stable-baselines3>=2.0.0
+
+# TensorBoard for logging and visualization
+tensorboard>=2.10.0
+
+# Optional: For better performance with SB3
+# torch>=2.0.0  # PyTorch (if not already installed)
+
+# Optional: Ray RLlib for advanced distributed RL
+# ray[rllib]>=2.0.0
+
+# Optional: Plotting and analysis
+# matplotlib>=3.5.0
+# seaborn>=0.12.0
+# pandas>=1.5.0

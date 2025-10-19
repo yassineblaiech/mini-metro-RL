@@ -51,6 +51,7 @@ class Trail:
     """A connection (segment) between two stations."""
     station_a: int
     station_b: int
+    waypoints: List[Tuple[int, int]] = field(default_factory=list)  # Intermediate points for orthogonal/diagonal paths
 
 @dataclass
 class Line:
@@ -189,6 +190,14 @@ class Line:
             elif trail.station_b == station_id: neighbors.append(trail.station_a)
         return neighbors
 
+    def get_trail_between(self, station_a_id: int, station_b_id: int) -> 'Trail | None':
+        """Gets the trail connecting two stations, regardless of direction."""
+        for trail in self.trails:
+            if (trail.station_a == station_a_id and trail.station_b == station_b_id) or \
+               (trail.station_a == station_b_id and trail.station_b == station_a_id):
+                return trail
+        return None
+
 @dataclass
 class Train:
     id: int
@@ -202,6 +211,9 @@ class Train:
     carriages: int = 0
     current_station_id: int | None = None
     target_station_id: int | None = None
+    # For following waypoints along orthogonal paths
+    waypoint_index: int = 0  # Which waypoint segment we're on
+    waypoint_progress: float = 0.0  # Progress within current waypoint segment
     def effective_capacity(self):
         return self.capacity + self.carriages * 3
 

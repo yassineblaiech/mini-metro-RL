@@ -7,6 +7,7 @@ from typing import Dict, List, Tuple
 from .entities import Station, Passenger, Line, Train
 from .entities import Obstacle, Trail, ShapeType
 from .rendering import Renderer
+from .game_logic import calculate_orthogonal_path, calculate_orthogonal_distance
 
 SHAPES = ['circle', 'square', 'triangle', 'pentagon']
 LINE_COLORS = [(220,20,60),(30,144,255),(34,139,34),(255,165,0),(148,0,211),(0,191,255)]
@@ -47,6 +48,9 @@ class Game:
         self.selected_color = self.available_colors[0]
         self.sidebar_width = 120
         self.temp_mouse_pos = None
+        # Click-and-drag line creation (manual game only)
+        self.is_dragging_line = False
+        self.intermediate_stations: List[int] = []  # Stations crossed during drag
         # editing existing line state
         self.current_edit_line_id = None
         self.current_edit_anchor = None  # 'start' or 'end'
@@ -204,21 +208,11 @@ class Game:
                                 self.pending_train_placement = None
 
                         elif self.selected_tool == 'line':
-                            if self.first_station_for_trail is None:
-                                # This is the first station clicked for a new trail.
-                                self.first_station_for_trail = clicked.id
-                                self.temp_mouse_pos = pos # For drawing a preview line
-                            else:
-                                # This is the second station. Create the trail.
-                                station_a_id = self.first_station_for_trail
-                                station_b_id = clicked.id
-
-                                if station_a_id != station_b_id:
-                                    self.draw_trail_in_line(station_a_id, station_b_id)
-
-                                # Reset for the next trail operation.
-                                self.first_station_for_trail = None
-                                self.temp_mouse_pos = None
+                            # Click-and-drag line creation: Start dragging
+                            self.first_station_for_trail = clicked.id
+                            self.temp_mouse_pos = pos
+                            self.is_dragging_line = True
+                            self.intermediate_stations = [clicked.id]
                         
                         elif self.selected_tool == 'remove':
                             if self.first_station_for_trail is None:
@@ -275,16 +269,33 @@ class Game:
                 # update temporary mouse pos when drawing a line
                 if (self.first_station_for_trail is not None and self.selected_tool in ['line', 'remove']) or self.dragging_tool:
                     self.temp_mouse_pos = ev.pos
+
+                    # Click-and-drag: Check for intermediate stations being crossed
+                    if self.is_dragging_line and self.selected_tool == 'line':
+                        station = self.station_at_pos(ev.pos)
+                        if station and station.id not in self.intermediate_stations:
+                            self.intermediate_stations.append(station.id)
             elif ev.type == pygame.MOUSEBUTTONUP:
-                if ev.button == 1 and self.dragging_tool == 'locomotive':
+                if ev.button == 1 and self.is_dragging_line and self.selected_tool == 'line':
+                    # Click-and-drag: Finalize the line by connecting all intermediate stations
+                    if len(self.intermediate_stations) >= 2:
+                        # Connect each consecutive pair of stations
+                        for i in range(len(self.intermediate_stations) - 1):
+                            self.draw_trail_in_line(self.intermediate_stations[i], self.intermediate_stations[i + 1])
+
+                    # Reset drag state
+                    self.is_dragging_line = False
+                    self.first_station_for_trail = None
+                    self.temp_mouse_pos = None
+                    self.intermediate_stations = []
+
+                elif ev.button == 1 and self.dragging_tool == 'locomotive':
                     # Dropped the locomotive
                     self.dragging_tool = None
-                    found = self.find_trail_at_pos(ev.pos)
-                    if found:
-                        self.pending_train_placement = {
-                            'line_id': found['line_id'],
-                            'trail': found['trail']
-                        }
+                    trail_info = self.find_trail_at_pos(ev.pos)
+                    if trail_info:
+                        line_id, trail = trail_info
+                        self.pending_train_placement = {'line_id': line_id, 'trail': trail}
                     self.temp_mouse_pos = None
 
             elif ev.type == pygame.KEYDOWN:
@@ -345,30 +356,59 @@ class Game:
         return None
 
     def find_trail_at_pos(self, pos, threshold=10):
-        """Finds the closest trail to a given mouse position."""
+        """
+        Finds the closest trail to a given mouse position.
+        Takes into account parallel line offsets for shared segments.
+        """
+        from .game_logic import find_shared_segments, calculate_line_offset_for_segment, offset_waypoints
+
         px, py = pos
+        shared_segments = find_shared_segments(self.lines)
+        closest_trail = None
+        closest_dist = threshold
+
         for line_id, line in self.lines.items():
             for trail in line.trails:
                 s1 = self.stations.get(trail.station_a)
                 s2 = self.stations.get(trail.station_b)
-                if not s1 or not s2: continue
+                if not s1 or not s2:
+                    continue
 
-                x1, y1 = s1.pos
-                x2, y2 = s2.pos
+                # Get waypoints (orthogonal path)
+                waypoints = trail.waypoints if trail.waypoints else [s1.pos, s2.pos]
 
-                # Basic point-to-line-segment distance calculation
-                dx, dy = x2 - x1, y2 - y1
-                if dx == 0 and dy == 0: continue # segment is a point
-                
-                t = ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)
-                t = max(0, min(1, t)) # clamp to segment
+                # Calculate offset for this line on this segment
+                segment_key = tuple(sorted([trail.station_a, trail.station_b]))
+                offset_distance = calculate_line_offset_for_segment(line_id, segment_key, shared_segments)
 
-                closest_x, closest_y = x1 + t * dx, y1 + t * dy
-                dist = math.hypot(px - closest_x, py - closest_y)
+                # Apply offset if on shared segment
+                if abs(offset_distance) > 0.1:
+                    render_waypoints = offset_waypoints(waypoints, offset_distance)
+                else:
+                    render_waypoints = waypoints
 
-                if dist < threshold:
-                    return {'line_id': line_id, 'trail': trail}
-        return None
+                # Check distance to each segment of the rendered path
+                for i in range(len(render_waypoints) - 1):
+                    x1, y1 = render_waypoints[i]
+                    x2, y2 = render_waypoints[i + 1]
+
+                    dx, dy = x2 - x1, y2 - y1
+                    if dx == 0 and dy == 0:
+                        continue
+
+                    # Point-to-line-segment distance
+                    t = ((px - x1) * dx + (py - y1) * dy) / (dx*dx + dy*dy)
+                    t = max(0, min(1, t))
+
+                    closest_x = x1 + t * dx
+                    closest_y = y1 + t * dy
+                    dist = math.hypot(px - closest_x, py - closest_y)
+
+                    if dist < closest_dist:
+                        closest_dist = dist
+                        closest_trail = (line_id, trail)
+
+        return closest_trail
 
     def place_new_train(self, line_id: int, start_station_id: int, next_station_id: int):
         """Creates and places a new train on a line, setting its initial direction."""
@@ -396,6 +436,7 @@ class Game:
     def find_shortest_path_distance(self, start_id: int, end_id: int) -> float:
         """
         Calculates the shortest travel distance (in pixels) between two stations using Dijkstra's algorithm.
+        Uses orthogonal/diagonal distance (Mini Metro style) instead of Euclidean distance.
         Returns float('inf') if no path exists.
         """
         if start_id == end_id:
@@ -403,7 +444,7 @@ class Game:
 
         distances = {station_id: float('inf') for station_id in self.stations}
         distances[start_id] = 0
-        
+
         pq = [(0, start_id)]  # (distance, station_id)
 
         while pq:
@@ -419,14 +460,16 @@ class Game:
             for line_id in self.station_lines.get(current_id, []):
                 line = self.lines[line_id]
                 for neighbor_id in line.get_neighbors(current_id):
-                    # Calculate the pixel distance of this trail
-                    edge_dist = math.hypot(self.stations[current_id].pos[0] - self.stations[neighbor_id].pos[0],
-                                          self.stations[current_id].pos[1] - self.stations[neighbor_id].pos[1])
-                    
+                    # Calculate the orthogonal/diagonal distance of this trail
+                    edge_dist = calculate_orthogonal_distance(
+                        self.stations[current_id].pos,
+                        self.stations[neighbor_id].pos
+                    )
+
                     if distances[current_id] + edge_dist < distances[neighbor_id]:
                         distances[neighbor_id] = distances[current_id] + edge_dist
                         heapq.heappush(pq, (distances[neighbor_id], neighbor_id))
-        
+
         return float('inf') # No path found
 
     def update_exchange_caches(self, changed_line: Line | None = None):
@@ -598,11 +641,19 @@ class Game:
         """
         Adds a trail between two stations to the line of the currently selected color.
         Creates a new line if one of that color doesn't exist.
+        Calculates orthogonal/diagonal waypoints for Mini Metro-style line rendering.
+        Automatically adds a train to new lines.
         """
-        new_trail = Trail(station_a_id, station_b_id)
+        # Calculate orthogonal path waypoints
+        pos_a = self.stations[station_a_id].pos
+        pos_b = self.stations[station_b_id].pos
+        waypoints = calculate_orthogonal_path(pos_a, pos_b)
+
+        new_trail = Trail(station_a_id, station_b_id, waypoints=waypoints)
 
         # Find if a line with the selected color already exists.
         target_line = None
+        is_new_line = False
         for line in self.lines.values():
             if line.color == self.selected_color:
                 target_line = line
@@ -613,10 +664,19 @@ class Game:
             target_line = Line(id=self.next_line_id, color=self.selected_color)
             self.lines[self.next_line_id] = target_line
             self.next_line_id += 1
+            is_new_line = True
 
         if target_line.can_add_trail(new_trail):
             target_line.add_trail(new_trail)
             self.update_exchange_caches(target_line)
+
+            # Auto-add train to new line (first segment only)
+            if is_new_line and len(target_line.trails) == 1:
+                self.place_new_train(
+                    line_id=target_line.id,
+                    start_station_id=station_a_id,
+                    next_station_id=station_b_id
+                )
 
     def run(self):
         last = time.time()

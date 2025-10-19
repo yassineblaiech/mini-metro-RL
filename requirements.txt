@@ -1,1 +1,14 @@
+# Core dependencies for the game
 pygame>=2.0.0
+
+# RL environment dependencies
+numpy>=1.21.0
+gymnasium>=0.29.0
+
+# RL training dependencies
+stable-baselines3>=2.0.0
+sb3-contrib>=2.0.0
+tensorboard>=2.10.0
+
+# Optional: For advanced RL frameworks
+# ray[rllib]>=2.0.0

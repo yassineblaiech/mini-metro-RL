@@ -48,6 +48,11 @@ htmlcov/
 # Ignore compiled cache in submodules
 game/__pycache__/
 
+# --- RL Training outputs ---
+models/
+logs/
+*.zip
+
 # --- Pygame window captures / screenshots (if any) ---
 *.png
 *.jpg
@@ -56,3 +61,8 @@ game/__pycache__/
 # --- Bytecode or profiling dumps ---
 *.prof
 *.dat
+*.claude
+
+logs/
+models/
+*.zip
